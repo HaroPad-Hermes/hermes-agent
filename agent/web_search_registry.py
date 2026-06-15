@@ -124,6 +124,7 @@ _LEGACY_PREFERENCE = (
     "parallel",
     "tavily",
     "exa",
+    "crawl4ai",
     "searxng",
     "brave-free",
     "ddgs",

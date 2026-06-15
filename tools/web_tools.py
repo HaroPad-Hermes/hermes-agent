@@ -12,6 +12,7 @@ Available tools:
 - web_extract_tool: Extract content from specific web pages
 
 Backend compatibility:
+- Crawl4AI: https://github.com/unclecode/crawl4ai (self-hosted extract-only)
 - Exa: https://exa.ai (search, extract)
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
@@ -230,6 +231,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "crawl4ai":
+        return bool(os.getenv("CRAWL4AI_URL", "http://localhost:11235").strip())
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
@@ -280,6 +283,7 @@ def _web_requires_env() -> list[str]:
     simply don't have the vars set, so the extra entries are harmless.
     """
     return [
+        "CRAWL4AI_URL",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
@@ -891,6 +895,126 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return tool_error(error_msg)
 
 
+# ─── HTTP-first extraction fallback ────────────────────────────────────────
+# When no extraction backend is available (e.g., SearXNG is search-only),
+# try a plain HTTP GET + markdownify before giving up.  This handles
+# static documentation, blogs, and plain-text endpoints in < 1 s without
+# a headless browser.
+
+HTTP_EXTRACT_TIMEOUT = 15
+HTTP_EXTRACT_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+async def _fetch_url_via_http(url: str, fmt: str = "markdown") -> Optional[Dict[str, Any]]:
+    """Try to extract page content via a plain HTTP GET (no JavaScript).
+
+    The Firecrawl backend renders every page with a headless browser,
+    which is slow for static documentation, blogs, and plain-text
+    endpoints.  This function uses httpx + markdownify to convert HTML
+    to Markdown in-process — it completes in < 1 s for most static
+    pages.
+
+    Returns a dict in the same shape as a Firecrawl scrape result,
+    or ``None`` when HTTP extraction cannot produce useful content
+    (page requires JavaScript, non-HTML response, timeout, etc.).
+    """
+    try:
+        from markdownify import markdownify as _md  # noqa: F811
+    except ImportError:
+        logger.debug("markdownify not available -- HTTP extraction disabled")
+        return None
+
+    headers = {
+        "User-Agent": "Hermes-Agent/1.0 (web_extract HTTP fallback)",
+        "Accept": "text/html,application/xhtml+xml,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(HTTP_EXTRACT_TIMEOUT),
+            headers=headers,
+            limits=httpx.Limits(max_keepalive_connections=5),
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+
+            ct = resp.headers.get("content-type", "")
+            if "text/html" not in ct and "text/plain" not in ct:
+                logger.debug(
+                    "HTTP extract: non-HTML content-type %r for %s", ct, url
+                )
+                # Carry on -- servers occasionally ship HTML with odd types.
+
+            cl = resp.headers.get("content-length")
+            if cl and int(cl) > HTTP_EXTRACT_MAX_BYTES:
+                logger.debug(
+                    "HTTP extract: page too large (%s bytes) for %s", cl, url
+                )
+                return None
+
+            raw = resp.text[:HTTP_EXTRACT_MAX_BYTES]
+            if not raw or len(raw) < 100:
+                logger.debug(
+                    "HTTP extract: page too short (%d chars) -- "
+                    "likely JS-only: %s",
+                    len(raw), url,
+                )
+                return None
+
+            final_url = str(resp.url)
+
+            if fmt == "html":
+                content = raw
+            else:
+                content = _md(
+                    raw,
+                    heading_style="ATX",
+                    strip=["script", "style", "noscript"],
+                )
+
+            # Extract <title> from raw HTML
+            title = ""
+            try:
+                m = re.search(
+                    r"<title[^>]*>(.*?)</title>",
+                    raw, re.IGNORECASE | re.DOTALL,
+                )
+                if m:
+                    title = m.group(1).strip()
+            except Exception:
+                pass
+
+            logger.info(
+                "HTTP extract succeeded for %s (%d chars markdown)",
+                url, len(content),
+            )
+
+            return {
+                "url": final_url,
+                "title": title,
+                "content": content,
+                "raw_content": content if fmt != "html" else raw,
+                "metadata": {
+                    "title": title,
+                    "sourceURL": final_url,
+                    "extraction_method": "http",
+                    "statusCode": resp.status_code,
+                },
+            }
+
+    except httpx.HTTPStatusError as exc:
+        logger.debug("HTTP extract: %s for %s", exc.response.status_code, url)
+        return None
+    except httpx.TimeoutException:
+        logger.debug("HTTP extract: timeout for %s", url)
+        return None
+    except Exception as exc:
+        logger.debug("HTTP extract failed for %s: %s", url, exc)
+        return None
+
+
 async def web_extract_tool(
     urls: List[str],
     format: str = None,
@@ -1000,18 +1124,32 @@ async def web_extract_tool(
                 # isn't registered at all (typo / uninstalled plugin), fall
                 # through to the active-provider walk.
                 if provider is not None and not provider.supports_extract():
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "error": (
-                                f"{provider.display_name} is a search-only "
-                                "backend and cannot extract URL content. "
-                                "Set web.extract_backend to firecrawl, "
-                                "tavily, exa, or parallel."
-                            ),
-                        },
-                        ensure_ascii=False,
-                    )
+                    # Search-only backend (e.g. SearXNG) — try HTTP
+                    # extraction as a fallback before giving up.
+                    http_results = []
+                    for url in safe_urls:
+                        http_result = await _fetch_url_via_http(url, fmt=format)
+                        if http_result is not None:
+                            http_results.append(http_result)
+                        else:
+                            http_results.append({
+                                "url": url, "title": "", "content": "",
+                                "error": (
+                                    f"HTTP extraction failed for {url} "
+                                    "(page may require JavaScript). "
+                                    f"{provider.display_name} is search-only "
+                                    "and does not support URL extraction."
+                                ),
+                            })
+                    results = http_results
+                    # Skip further provider resolution — we already have results.
+                    ssrf_done = True
+                else:
+                    ssrf_done = False
+            else:
+                ssrf_done = False
+
+            if not ssrf_done:
                 provider = get_active_extract_provider()
                 if provider is None:
                     return json.dumps(
@@ -1019,28 +1157,28 @@ async def web_extract_tool(
                             "success": False,
                             "error": (
                                 "No web extract provider configured. "
-                                "Set web.extract_backend to firecrawl, "
+                                "Set web.extract_backend to crawl4ai, firecrawl, "
                                 "tavily, exa, or parallel."
                             ),
                         },
                         ensure_ascii=False,
                     )
 
-            logger.info(
-                "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
-            )
-
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
-            import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
+                logger.info(
+                    "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
                 )
+
+                # Async-or-sync dispatch: parallel + firecrawl have async
+                # extract(); exa + tavily are sync.
+                import inspect
+                if inspect.iscoroutinefunction(provider.extract):
+                    results = await provider.extract(safe_urls, format=format)
+                else:
+                    # Run sync extract() in a thread so we don't block the
+                    # event loop on network I/O.
+                    results = await asyncio.to_thread(
+                        provider.extract, safe_urls, format=format
+                    )
 
         # Merge any SSRF-blocked results back in
         if ssrf_blocked:

@@ -1,0 +1,7 @@
+name: web-crawl4ai
+version: 1.0.0
+description: "Crawl4AI self-hosted web extract provider. Requires a running Crawl4AI Docker container (unclecode/crawl4ai:latest on port 11235). Extract-only — use SearXNG or another backend for search. CRAWL4AI_URL defaults to http://localhost:11235."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - crawl4ai

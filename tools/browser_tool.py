@@ -3420,13 +3420,36 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         }
         if vision_model:
             call_kwargs["model"] = vision_model
+        # Detect if vision is configured for a local endpoint (LM Studio, Ollama,
+        # etc.) and wrap the call with retry so transient "no model loaded" errors
+        # retry instead of failing.  Mirrors the routing in vision_analyze_tool.
+        vision_base_url = ""
+        try:
+            from hermes_cli.config import load_config as _load_cfg_bv
+            _vision_cfg_bv = cfg_get(_load_cfg_bv(), "auxiliary", "vision", default={})
+            vision_base_url = str(_vision_cfg_bv.get("base_url") or "")
+        except Exception:
+            pass
+
+        from tools.vision_tools import (
+            _is_local_vision_endpoint,
+            _call_vision_llm_local_retry,
+            _is_image_size_error,
+            _resize_image_for_vision,
+            _RESIZE_TARGET_BYTES,
+        )
+        _is_local = bool(vision_base_url and _is_local_vision_endpoint(vision_base_url))
+
+        def _do_vision_call():
+            if _is_local:
+                import asyncio
+                return asyncio.run(_call_vision_llm_local_retry(call_kwargs, vision_base_url))
+            return call_llm(**call_kwargs)
+
         # Try full-size screenshot; on size-related rejection, downscale and retry.
         try:
-            response = call_llm(**call_kwargs)
+            response = _do_vision_call()
         except Exception as _api_err:
-            from tools.vision_tools import (
-                _is_image_size_error, _resize_image_for_vision, _RESIZE_TARGET_BYTES,
-            )
             if (_is_image_size_error(_api_err)
                     and len(data_url) > _RESIZE_TARGET_BYTES):
                 logger.info(
@@ -3438,7 +3461,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 data_url = _resize_image_for_vision(
                     screenshot_path, mime_type="image/png")
                 call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
-                response = call_llm(**call_kwargs)
+                response = _do_vision_call()
             else:
                 raise
 

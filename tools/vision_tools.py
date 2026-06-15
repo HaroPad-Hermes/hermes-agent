@@ -798,6 +798,124 @@ async def _vision_analyze_native(
                 pass
 
 
+# ── Local vision endpoint retry helpers ──────────────────────────────────
+# Local endpoints (LM Studio, Ollama, llama.cpp) may need time to auto-load
+# the vision model.  Instead of letting async_call_llm instantly fall back to
+# remote providers on connection errors, retry the local endpoint with
+# exponential backoff for up to the configured timeout.
+_LOCAL_VISION_HOSTS: frozenset = frozenset({
+    "localhost", "127.0.0.1", "::1", "0.0.0.0",
+})
+
+
+def _is_local_vision_endpoint(base_url: str) -> bool:
+    """True when *base_url* points to a local vision server (LM Studio, Ollama, etc.)."""
+    if not base_url or not isinstance(base_url, str):
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(base_url).hostname or "").lower()
+        if host in _LOCAL_VISION_HOSTS:
+            return True
+        # RFC 1918 + CGNAT private blocks (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+        if host.startswith("192.168.") or host.startswith("10."):
+            return True
+        if host.startswith("172.") and 16 <= int(host.split(".")[1]) <= 31:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _call_vision_llm_local_retry(
+    call_kwargs: dict,
+    base_url: str,
+    max_retry_seconds: float = 120,
+    initial_delay: float = 2.0,
+):
+    """Call async_call_llm with retries for local vision endpoints.
+
+    Local endpoints (LM Studio) may auto-unload models after idle time.
+    LM Studio does NOT auto-load on a request with an unrecognized model
+    name (e.g. "deepseek-v4-pro") — it returns "No models loaded" and gives
+    up.  But it WILL auto-load when the request names a locally-cached model.
+
+    So on the first "no model" error we query /v1/models, substitute the
+    request model with a locally-available one, and retry.  LM Studio then
+    loads the model in the background; we keep retrying with backoff until
+    it's ready or the deadline expires.
+    """
+    import asyncio
+    import httpx
+    from agent.auxiliary_client import _is_connection_error
+
+    deadline = asyncio.get_event_loop().time() + max_retry_seconds
+    delay = initial_delay
+    last_error = None
+    model_swapped = False  # only query /v1/models once
+
+    while True:
+        try:
+            return await async_call_llm(**call_kwargs)
+        except Exception as exc:
+            last_error = exc
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            err_str = str(exc).lower()
+            is_retryable = _is_connection_error(exc) or any(
+                kw in err_str
+                for kw in (
+                    "no model",
+                    "no models",
+                    "load a model",
+                    "loading model",
+                    "service unavailable",
+                    "503",
+                )
+            )
+            if not is_retryable:
+                break
+
+            # On first "no model" error, try to find a local model name
+            # that LM Studio recognizes so it triggers auto-load.
+            if not model_swapped and any(kw in err_str for kw in ("no model", "no models", "load a model")):
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get(f"{base_url.rstrip('/')}/models")
+                        if resp.status_code == 200:
+                            models_data = resp.json().get("data", [])
+                            local_models = [m.get("id", "") for m in models_data if m.get("id")]
+                            if local_models:
+                                # Prefer a vision model if available, else first model
+                                vision_hints = ("vl", "vision", "gemma", "qwen", "llava", "pixtral")
+                                chosen = next(
+                                    (m for m in local_models if any(h in m.lower() for h in vision_hints)),
+                                    local_models[0],
+                                )
+                                if chosen and chosen != call_kwargs.get("model"):
+                                    logger.info(
+                                        "Local vision: swapping model %r → %r to trigger LM Studio auto-load",
+                                        call_kwargs.get("model"), chosen,
+                                    )
+                                    call_kwargs["model"] = chosen
+                                    model_swapped = True
+                except Exception:
+                    logger.debug("Could not query LM Studio /models, will retry as-is", exc_info=True)
+
+            logger.info(
+                "Local vision endpoint not ready, retrying in %.1fs "
+                "(%.0fs remaining)… Error: %s",
+                delay,
+                remaining,
+                str(exc)[:120],
+            )
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 30.0)  # exponential backoff, capped at 30s
+
+    raise last_error
+
+
 async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
@@ -952,6 +1070,7 @@ async def vision_analyze_tool(
         # Local vision models (llama.cpp, ollama) can take well over 30s.
         vision_timeout = 120.0
         vision_temperature = 0.1
+        vision_base_url = ""
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
@@ -962,6 +1081,9 @@ async def vision_analyze_tool(
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)
+            _vbu = _vision_cfg.get("base_url") or ""
+            if _vbu:
+                vision_base_url = str(_vbu)
         except Exception:
             pass
         call_kwargs = {
@@ -973,9 +1095,19 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+
+        # Select the right call path: local endpoints get retry-with-backoff
+        # so transient "model not loaded" errors retry instead of falling back.
+        _is_local = bool(vision_base_url and _is_local_vision_endpoint(vision_base_url))
+
+        async def _call_llm():
+            if _is_local:
+                return await _call_vision_llm_local_retry(call_kwargs, vision_base_url)
+            return await async_call_llm(**call_kwargs)
+
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
-            response = await async_call_llm(**call_kwargs)
+            response = await _call_llm()
         except Exception as _api_err:
             if (_is_image_size_error(_api_err)
                     and len(image_data_url) > _RESIZE_TARGET_BYTES):
@@ -988,7 +1120,7 @@ async def vision_analyze_tool(
                 image_data_url = _resize_image_for_vision(
                     temp_image_path, mime_type=detected_mime_type)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
-                response = await async_call_llm(**call_kwargs)
+                response = await _call_llm()
             else:
                 raise
         
@@ -998,7 +1130,7 @@ async def vision_analyze_tool(
         # Retry once on empty content (reasoning-only response)
         if not analysis:
             logger.warning("Vision LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
+            response = await _call_llm()
             analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis)

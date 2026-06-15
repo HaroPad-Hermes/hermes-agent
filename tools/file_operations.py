@@ -1053,6 +1053,11 @@ class ShellFileOperations(FileOperations):
         Returns:
             ReadResult with content, metadata, or error info
         """
+        # Guard against empty path
+        if not path:
+            return ReadResult(error="Empty path — the file path was not provided.")
+        # Normalize path (handles stale-session cwd issues on Windows)
+        path = os.path.abspath(os.path.expanduser(path))
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         

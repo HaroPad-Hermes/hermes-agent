@@ -63,6 +63,12 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Prevent console windows from spawning when a GUI process (pythonw.exe)
+# calls a console application (uv.exe) via subprocess.  CREATE_NO_WINDOW
+# is harmless on non-Windows platforms — it's just a DWORD flag that is
+# ignored by POSIX subprocess creation paths.
+_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 # =============================================================================
 # Allowlist of lazy-installable backends.
@@ -380,7 +386,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             r = subprocess.run(
                 [uv_bin, "pip", "install", *specs],
                 capture_output=True, text=True, timeout=timeout, env=uv_env,
-                stdin=subprocess.DEVNULL,
+stdin=subprocess.DEVNULL,
+                creationflags=_CREATION_FLAGS,
             )
             if r.returncode == 0:
                 return _InstallResult(True, r.stdout or "", r.stderr or "")
@@ -394,7 +401,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         probe = subprocess.run(
             pip_cmd + ["--version"],
             capture_output=True, text=True, timeout=15,
-            stdin=subprocess.DEVNULL,
+stdin=subprocess.DEVNULL,
+                creationflags=_CREATION_FLAGS,
         )
         if probe.returncode != 0:
             raise FileNotFoundError("pip not in venv")
@@ -403,7 +411,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             subprocess.run(
                 [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
                 capture_output=True, text=True, timeout=120, check=True,
-                stdin=subprocess.DEVNULL,
+stdin=subprocess.DEVNULL,
+                creationflags=_CREATION_FLAGS,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             return _InstallResult(False, "",
@@ -413,7 +422,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         r = subprocess.run(
             pip_cmd + ["install", *specs],
             capture_output=True, text=True, timeout=timeout,
-            stdin=subprocess.DEVNULL,
+stdin=subprocess.DEVNULL,
+                creationflags=_CREATION_FLAGS,
         )
         return _InstallResult(r.returncode == 0, r.stdout or "", r.stderr or "")
     except subprocess.TimeoutExpired as e:
