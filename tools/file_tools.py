@@ -1477,7 +1477,13 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    path = args.get("path", "")
+    if not path:
+        return tool_error(
+            "read_file: path is empty or missing. "
+            "Provide a valid file path to read."
+        )
+    return read_file_tool(path=path, offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
 def _handle_write_file(args, **kw):

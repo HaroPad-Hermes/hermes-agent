@@ -258,6 +258,44 @@ import json
 import shutil
 import stat
 import subprocess
+
+# === asyncio preload (Python 3.11/3.14 import-order workaround) ==============
+# During the full import chain, ``asyncio/__init__.py`` can hit a
+# ``NameError: name 'base_events' is not defined`` when imported deep
+# inside a cascade (fastapi → anyio → asyncio).  Preloading it early
+# sidesteps the race.  Harmless on unaffected Pythons.
+import asyncio  # noqa: F401
+
+# === No-console subprocess patch (Windows) ===================================
+# When running via pythonw.exe the Gateway/Dashboard has no console.  Any
+# console-mode child (git.exe, docker.exe, cmd.exe, etc.) would normally
+# cause Windows to allocate a visible terminal.  This monkey-patch adds
+# CREATE_NO_WINDOW to every subprocess.run/Popen/call so tool execution
+# stays invisible.  Callers who set explicit creationflags keep theirs.
+import sys as _sys
+if _sys.platform == 'win32':
+    _orig_run = subprocess.run
+    _orig_popen = subprocess.Popen
+    _orig_call = subprocess.call
+
+    def _patched_run(*args, **kwargs):
+        if 'creationflags' not in kwargs:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        return _orig_run(*args, **kwargs)
+
+    def _patched_popen(*args, **kwargs):
+        if 'creationflags' not in kwargs:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        return _orig_popen(*args, **kwargs)
+
+    def _patched_call(*args, **kwargs):
+        if 'creationflags' not in kwargs:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        return _orig_call(*args, **kwargs)
+
+    subprocess.run = _patched_run
+    subprocess.Popen = _patched_popen
+    subprocess.call = _patched_call
 from pathlib import Path
 from typing import Optional
 
