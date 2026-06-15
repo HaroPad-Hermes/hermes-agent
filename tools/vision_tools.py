@@ -1230,6 +1230,8 @@ async def vision_analyze_tool(
     task_id: Optional[str] = None,
     region: Optional[list] = None,
     system_prompt: str = None,
+    provider: str = None,
+    base_url: str = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -1443,6 +1445,10 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+        if provider:
+            call_kwargs["provider"] = provider
+        if base_url:
+            call_kwargs["base_url"] = base_url
         _load_auxiliary_client()
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
@@ -1680,6 +1686,62 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
+async def _vision_analyze_with_fallback(
+    image_url: str,
+    full_prompt: str,
+    model: str,
+    system_prompt: str,
+    task_id: Optional[str] = None,
+    region: Optional[list] = None,
+) -> str:
+    """Call vision_analyze_tool with Gemini model fallback on 503 errors."""
+    _FALLBACKS = [
+        # (provider, model, base_url) — None means use configured defaults
+        (None, None, None),  # slot 0 = configured model (gemini-3.5-flash)
+        ("gemini", "gemini-2.5-flash", None),
+        ("openai_compatible", "gemma-4-12b-it-qat", "http://127.0.0.1:1234/v1"),
+    ]
+
+    last_error = None
+    for _fb_provider, _fb_model, _fb_base_url in _FALLBACKS:
+        try:
+            result = await vision_analyze_tool(
+                image_url, full_prompt,
+                model=_fb_model or model,
+                system_prompt=system_prompt,
+                provider=_fb_provider,
+                base_url=_fb_base_url,
+                task_id=task_id,
+                region=region,
+            )
+            result_data = json.loads(result)
+            if result_data.get("success"):
+                if _fb_model:
+                    logger.info("vision_analyze: fallback model %s succeeded", _fb_model)
+                return result
+            err_msg = result_data.get("error", "")
+            if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg:
+                logger.warning("vision_analyze: 503 on %s, trying fallback", _fb_model or model)
+                last_error = result
+                continue
+            return result  # non-503 error, return as-is
+        except Exception as e:
+            err_str = str(e)
+            if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                logger.warning("vision_analyze: 503 on %s, trying fallback", _fb_model or model)
+                last_error = str(e)
+                continue
+            raise
+
+    if last_error:
+        return last_error if isinstance(last_error, str) else json.dumps({
+            "success": False,
+            "error": "All vision model fallbacks exhausted",
+            "analysis": "All vision models returned errors."
+        })
+    return json.dumps({"success": False, "error": "No vision models available"})
+
+
 async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
@@ -1733,8 +1795,8 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
         pass
     if not model:
         model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return await vision_analyze_tool(
-        image_url, full_prompt, model, task_id=task_id, region=region, system_prompt=system_prompt
+    return await _vision_analyze_with_fallback(
+        image_url, full_prompt, model, system_prompt, task_id=task_id, region=region
     )
 
 
