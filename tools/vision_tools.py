@@ -1315,6 +1315,7 @@ async def vision_analyze_tool(
     model: str = None,
     task_id: Optional[str] = None,
     region: Optional[list] = None,
+    system_prompt: str = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -1332,6 +1333,10 @@ async def vision_analyze_tool(
                          Accepts http://, https:// URLs or absolute/relative file paths.
         user_prompt (str): The pre-formatted prompt for the vision model
         model (str): The vision model to use (default: google/gemini-3-flash-preview)
+        system_prompt (str): Optional system-level instruction for the vision model
+                             (e.g., "You are an expert OCR reader. Transcribe all text verbatim.")
+                             Read from config auxiliary.vision.system_prompt or env var
+                             HERMES_VISION_SYSTEM_PROMPT.
     
     Returns:
         str: JSON string containing the analysis results with the following structure:
@@ -1472,8 +1477,17 @@ async def vision_analyze_tool(
         # Use the prompt as provided (model_tools.py now handles full description formatting)
         comprehensive_prompt = user_prompt
         
-        # Prepare the message with base64-encoded image
-        messages = [
+        # Prepare messages with base64-encoded image.
+        # If a system_prompt is configured (auxiliary.vision.system_prompt in config.yaml
+        # or HERMES_VISION_SYSTEM_PROMPT env var), prepend it as a system message so the
+        # vision model receives persistent role/behavior instructions.
+        messages = []
+        if system_prompt and system_prompt.strip():
+            messages.append({
+                "role": "system",
+                "content": system_prompt.strip()
+            })
+        messages.append(
             {
                 "role": "user",
                 "content": [
@@ -1489,7 +1503,7 @@ async def vision_analyze_tool(
                     }
                 ]
             }
-        ]
+        )
         
         logger.info("Processing image with vision model...")
         
@@ -1787,6 +1801,21 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
         logger.info("vision_analyze: native fast path")
         return await _vision_analyze_native(image_url, question, task_id=task_id, region=region)
 
+    # Resolve optional system prompt from config or env var.
+    # auxiliary.vision.system_prompt in config.yaml takes priority;
+    # HERMES_VISION_SYSTEM_PROMPT env var is the fallback.
+    _sys_prompt = ""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _cfg = load_config()
+        _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
+        _sys_prompt = _vision_cfg.get("system_prompt", "")
+    except Exception:
+        pass
+    if not _sys_prompt:
+        _sys_prompt = os.getenv("HERMES_VISION_SYSTEM_PROMPT", "")
+    system_prompt = _sys_prompt.strip() or None
+
     # Legacy path: aux LLM describes the image and we return its text.
     full_prompt = (
         "Fully describe and explain everything about this image, then answer the "
@@ -1804,7 +1833,9 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
         pass
     if not model:
         model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id, region=region)
+    return await vision_analyze_tool(
+        image_url, full_prompt, model, task_id=task_id, region=region, system_prompt=system_prompt
+    )
 
 
 registry.register(
