@@ -4279,6 +4279,19 @@ def resolve_vision_provider_client(
             explicit_api_key=resolved_api_key,
             api_mode=resolved_api_mode,
         )
+        if client is None and provider_for_base_override != "custom":
+            # Unknown provider name (e.g. "openai_compatible") with an
+            # explicit base_url — retry as a generic custom endpoint so
+            # the base_url + api_key path is used directly.
+            provider_for_base_override = "custom"
+            client, final_model = resolve_provider_client(
+                "custom",
+                model=resolved_model,
+                async_mode=async_mode,
+                explicit_base_url=resolved_base_url,
+                explicit_api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+            )
         if client is None:
             return provider_for_base_override, None, None
         return provider_for_base_override, client, final_model
