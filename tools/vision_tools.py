@@ -1353,10 +1353,15 @@ async def _vision_analyze_with_fallback(
     model: str,
     system_prompt: str,
 ) -> str:
-    """Call vision_analyze_tool with Gemini model fallback on 503 errors."""
+    """Call vision_analyze_tool with model fallback on errors.
+    
+    Fallback chain: configured model → gemini-3.5-flash → gemini-2.5-flash → local gemma.
+    503 errors trigger the next tier automatically.
+    """
     _FALLBACKS = [
         # (provider, model, base_url) — None means use configured defaults
-        (None, None, None),  # slot 0 = configured model (gemini-3.5-flash)
+        (None, None, None),  # slot 0 = configured model (MiMo-V2.5)
+        ("gemini", "gemini-3.5-flash", None),
         ("gemini", "gemini-2.5-flash", None),
         ("openai_compatible", "gemma-4-12b-it-qat", "http://127.0.0.1:1234/v1"),
     ]
