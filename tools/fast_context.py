@@ -69,11 +69,42 @@ def _check_fast_context_reqs() -> bool:
     return True
 
 
+def _estimate_repo_turns(work_dir: str) -> int:
+    """Estimate appropriate MAX_TURNS based on repo size.
+
+    Returns 12 for medium repos (100-500 source files), 16 for large
+    repos (500+), and 20 for very large repos (2000+).  Small repos
+    (<100 files) use the default of 8.
+    """
+    try:
+        # Quick file count with a ceiling and skip-list
+        skip_dirs = {'node_modules', '.git', '__pycache__', '.venv', 'venv',
+                     'dist', 'build', '.next', 'target', '.cache', 'coverage'}
+        count = 0
+        for _root, dirs, files in os.walk(work_dir):
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+            count += len(files)
+            if count > 3000:  # cap the walk
+                break
+        if count > 2000:
+            return 20
+        if count > 500:
+            return 16
+        if count > 100:
+            return 12
+        return 8
+    except Exception:
+        return 8  # safe default
+
+
 def _run_fast_context(query: str, repo_path: str, task_id: str = None) -> str:
     """Run the FastContext harness and return the final answer."""
     work_dir = os.path.abspath(repo_path or ".")
     if not os.path.isdir(work_dir):
         return tool_error(f"fast_context: repo_path does not exist or is not a directory: {work_dir}")
+
+    # Scale turn budget to repo size — larger repos need more exploration turns
+    max_turns = str(_estimate_repo_turns(work_dir))
 
     # Collect env vars, reading API key from the process environment
     api_key = os.getenv("DEEPSEEK_API_KEY", "")
@@ -81,7 +112,7 @@ def _run_fast_context(query: str, repo_path: str, task_id: str = None) -> str:
     env.update({
         "FASTCONTEXT_URL": "https://api.deepseek.com",
         "FASTCONTEXT_MODEL": "deepseek-v4-flash",
-        "FASTCONTEXT_MAX_TURNS": "8",
+        "FASTCONTEXT_MAX_TURNS": max_turns,
         "DEEPSEEK_API_KEY": api_key,
     })
 
