@@ -510,7 +510,7 @@ class ChatCompletionsTransport(ProviderTransport):
         # Per-model default cap — profiles override get_max_tokens() when
         # they front several backends with different completion-token limits
         # (e.g. opencode-go: mimo-v2.5-pro = 131072).
-        profile_max = profile.get_max_tokens(model)
+        profile_max = getattr(profile, 'get_max_tokens', lambda _m: None)(model)
 
         if ephemeral is not None and max_tokens_fn:
             api_kwargs.update(max_tokens_fn(ephemeral))
