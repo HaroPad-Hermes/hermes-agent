@@ -25,6 +25,20 @@ In ``auto`` mode:
     models.dev metadata, we attach natively.
   - Otherwise (non-vision model, no explicit override), we fall back to text.
 
+In ``native`` mode (the "I want native vision whenever possible" default):
+  - If the active model is *known* to be text-only (either via an explicit
+    ``model.supports_vision: false`` override or a models.dev lookup that
+    confirms no vision), the routing falls back to ``"text"`` instead of
+    forcing a provider-side ``unknown variant 'image_url'`` 400. This is
+    a per-turn safeguard: switching ``/model deepseek-v4-pro`` mid-session
+    on a user with ``image_input_mode: native`` won't crash.
+  - If the active model is known to be vision-capable, native wins.
+  - If the capability is unknown (``None`` from both override and
+    models.dev), native is preserved — the "try it and let the provider
+    reject loudly" behaviour stays intact for custom models absent from
+    models.dev. This avoids silently bypassing native vision on every
+    unrecognised model.
+
 This keeps ``vision_analyze`` surfaced as a tool in every session — skills
 and agent flows that chain it (browser screenshots, deeper inspection of
 URL-referenced images, style-gating loops) keep working. The routing only
@@ -303,6 +317,17 @@ def decide_image_input_mode(
             mode_cfg = _coerce_mode(agent_cfg.get("image_input_mode"))
 
     if mode_cfg == "native":
+        # Safeguard: when the active model is *known* to be text-only, fall
+        # back to the text pipeline rather than crashing with a provider-side
+        # ``unknown variant 'image_url', expected 'text'`` 400. Capability
+        # is "known" only when the user declared ``supports_vision: false``
+        # in config OR models.dev returned an authoritative ``False`` -- if
+        # both return ``None`` (custom model absent from models.dev with no
+        # override), native is preserved so the provider gets a chance to
+        # either accept the image or reject it loudly with a useful error.
+        supports = _lookup_supports_vision(provider, model, cfg)
+        if supports is False:
+            return "text"
         return "native"
     if mode_cfg == "text":
         return "text"
