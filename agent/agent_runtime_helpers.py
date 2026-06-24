@@ -1096,6 +1096,14 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         if assistant_message.reasoning_content not in reasoning_parts:
             reasoning_parts.append(assistant_message.reasoning_content)
     
+    # Check model_extra for reasoning_content (some OpenAI SDK versions store
+    # provider-specific fields in model_extra rather than as direct attributes).
+    # This mirrors the logic in build_assistant_message (chat_completion_helpers.py).
+    if not reasoning_parts and hasattr(assistant_message, 'model_extra'):
+        model_extra = getattr(assistant_message, 'model_extra', None) or {}
+        if isinstance(model_extra, dict) and model_extra.get('reasoning_content'):
+            reasoning_parts.append(model_extra['reasoning_content'])
+    
     # Check reasoning_details array (OpenRouter unified format)
     # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
     if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
