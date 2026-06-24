@@ -1895,11 +1895,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 model_name = chunk.model
 
             # Accumulate reasoning content
-            reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-            if reasoning_text:
-                reasoning_parts.append(reasoning_text)
+            # Check both direct attribute and model_extra (some SDK versions
+            # store provider-specific fields like reasoning_content in model_extra
+            # rather than as direct attributes on the delta object)
+            _delta_reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if not _delta_reasoning:
+                _delta_extra = getattr(delta, "model_extra", None) or {}
+                if isinstance(_delta_extra, dict) and _delta_extra.get("reasoning_content"):
+                    _delta_reasoning = _delta_extra["reasoning_content"]
+            if _delta_reasoning:
+                reasoning_parts.append(_delta_reasoning)
                 _fire_first_delta()
-                agent._fire_reasoning_delta(reasoning_text)
+                agent._fire_reasoning_delta(_delta_reasoning)
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
