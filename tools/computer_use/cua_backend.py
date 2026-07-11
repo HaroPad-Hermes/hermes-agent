@@ -418,8 +418,6 @@ class CuaDriverBackend(ComputerUseBackend):
             self._bridge.stop()
 
     def is_available(self) -> bool:
-        if not _is_macos():
-            return False
         return cua_driver_binary_available()
 
     # ── Capture ────────────────────────────────────────────────────
