@@ -8168,6 +8168,27 @@ def _resolve_task_provider_model(
     resolved_model = model or cfg_model
     resolved_api_mode = cfg_api_mode
 
+    # OpenCode Go serves gpt-* models (gpt-5.6-luna) ONLY via the Responses
+    # API — /v1/chat/completions and /v1/messages return empty content for
+    # them (images silently dropped, no error). The main chat path re-derives
+    # api_mode from the model via hermes_cli.models.opencode_model_api_mode
+    # on every call; the auxiliary path only read the config key, so
+    # auxiliary.vision pinned to a gpt-* model on opencode-go hit
+    # chat_completions and "could not be analyzed" with no visible error.
+    # Mirror the main-path derivation here (config api_mode still wins).
+    # Scoped to the exact broken case: gpt-* on opencode providers →
+    # codex_responses. Other models (qwen/minimax → anthropic_messages,
+    # deepseek/glm → chat_completions) keep their existing aux behavior.
+    if not resolved_api_mode and (provider or cfg_provider) and resolved_model:
+        _prov = str(provider or cfg_provider).strip().lower()
+        if _prov in {"opencode-go", "opencode-zen"}:
+            try:
+                from hermes_cli.models import opencode_model_api_mode
+                if opencode_model_api_mode(_prov, resolved_model) == "codex_responses":
+                    resolved_api_mode = "codex_responses"
+            except Exception:
+                pass
+
     # MoA virtual provider: an *explicit* `provider: moa` override (either the
     # caller-passed `provider` arg or `auxiliary.<task>.provider` in
     # config.yaml) reaches this function directly — it never goes through
