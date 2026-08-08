@@ -1697,8 +1697,8 @@ async def _vision_analyze_with_fallback(
     """Call vision_analyze_tool with Gemini model fallback on 503 errors."""
     _FALLBACKS = [
         # (provider, model, base_url) — None means use configured defaults
-        (None, None, None),  # slot 0 = configured model (gemini-3.5-flash)
-        ("gemini", "gemini-2.5-flash", None),
+        (None, None, None),  # slot 0 = configured model (auxiliary.vision)
+        ("xiaomi", "mimo-v2.5", None),
         ("openai_compatible", "gemma-4-12b-it-qat", "http://127.0.0.1:1234/v1"),
     ]
 
