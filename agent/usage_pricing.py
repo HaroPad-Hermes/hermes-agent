@@ -1242,9 +1242,22 @@ def _pricing_entry_from_metadata(
     if prompt is None and completion is None and request is None:
         return None
 
+    # Nahcrof/Crof advertise per-MILLION-token prices in ``pricing.prompt`` /
+    # ``pricing.completion`` (e.g. deepseek-v4-pro-0813 -> 0.35 = $0.35/M),
+    # unlike most OpenAI-compatible endpoints which report per-token.  The
+    # per-token scale would inflate those 1e6x ($350000/M), tripping the
+    # expensive-model guard with absurd figures and corrupting cost
+    # accounting.  Host-scoped so other providers are unaffected.
+    _prices_per_million = any(
+        base_url_host_matches(source_url, host)
+        for host in ("crof.ai", "nahcrof.com")
+    )
+
     def _per_token_to_per_million(value: Optional[Decimal]) -> Optional[Decimal]:
         if value is None:
             return None
+        if _prices_per_million:
+            return value  # already dollars per million tokens
         return value * _ONE_MILLION
 
     return PricingEntry(
